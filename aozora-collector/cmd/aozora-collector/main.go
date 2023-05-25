@@ -1,14 +1,25 @@
 package main
 
 import (
+	"archive/zip"
+	"bytes"
+	"database/sql"
+	"errors"
 	"fmt"
+	"io/ioutil"
 	"log"
+	"net/http"
 	"net/url"
 	"path"
 	"regexp"
 	"strings"
 
 	"github.com/PuerkitoBio/goquery"
+	"github.com/ikawaha/kagome-dict/ipa"
+	"github.com/ikawaha/kagome/v2/tokenizer"
+	_ "github.com/mattn/go-sqlite3"
+
+	"golang.org/x/text/encoding/japanese"
 )
 
 type Entry struct {
@@ -16,7 +27,7 @@ type Entry struct {
 	Author   string
 	TitleID  string
 	Title    string
-	InfoURL  string
+	SiteURL  string
 	ZipURL   string
 }
 
@@ -47,6 +58,42 @@ func findAuthorAndZIP(siteURL string) (string, string) {
 	return author, u.String()
 }
 
+func extractText(zipURL string) (string, error) {
+	resp, err := http.Get(zipURL)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	b, err := ioutil.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+	r, err := zip.NewReader(bytes.NewReader(b), int64(len(b)))
+	if err != nil {
+		return "", err
+	}
+
+	for _, file := range r.File {
+		if path.Ext(file.Name) == ".txt" {
+			f, err := file.Open()
+			if err != nil {
+				return "", err
+			}
+			b, err := ioutil.ReadAll(f)
+			f.Close()
+			if err != nil {
+				return "", err
+			}
+			b, err = japanese.ShiftJIS.NewDecoder().Bytes(b)
+			if err != nil {
+				return "", err
+			}
+			return string(b), nil
+		}
+	}
+	return "", errors.New("contents not found")
+}
+
 func findEntries(siteURL string) ([]Entry, error) {
 	doc, err := goquery.NewDocument(siteURL)
 	if err != nil {
@@ -68,7 +115,7 @@ func findEntries(siteURL string) ([]Entry, error) {
 				Author:   author,
 				TitleID:  token[2],
 				Title:    title,
-				InfoURL:  siteURL,
+				SiteURL:  siteURL,
 				ZipURL:   zipURL,
 			})
 		}
@@ -76,13 +123,87 @@ func findEntries(siteURL string) ([]Entry, error) {
 	return entries, nil
 }
 
+func setupDB(dsn string) (*sql.DB, error) {
+	db, err := sql.Open("sqlite3", dsn)
+	if err != nil {
+		log.Fatal(err)
+	}
+	queries := []string{
+		`CREATE TABLE IF NOT EXISTS authors(author_id TEXT, author TEXT, PRIMARY KEY(author_id))`,
+		`CREATE TABLE IF NOT EXISTS contents(author_id TEXT, title_id TEXT, title TEXT, content TEXT, PRIMARY KEY (author_id, title_id))`,
+		`CREATE VIRTUAL TABLE IF NOT EXISTS contents_fts USING fts4(words)`,
+	}
+	for _, query := range queries {
+		_, err = db.Exec(query)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return db, nil
+}
+
+func addEntry(db *sql.DB, entry *Entry, content string) error {
+	_, err := db.Exec(
+		`REPLACE INTO authors(author_id, author) VALUES(?, ?)`,
+		entry.AuthorID,
+		entry.Author,
+	)
+	if err != nil {
+		return err
+	}
+
+	res, err := db.Exec(
+		`REPLACE INTO contents(author_id, title_id, title, content) VALUES(?, ?, ?, ?)`,
+		entry.AuthorID,
+		entry.TitleID,
+		entry.Title,
+		content,
+	)
+	if err != nil {
+		return err
+	}
+	docID, err := res.LastInsertId()
+	if err != nil {
+		return err
+	}
+
+	t, err := tokenizer.New(ipa.Dict(), tokenizer.OmitBosEos())
+	if err != nil {
+		return err
+	}
+	seg := t.Wakati(content)
+	_, err = db.Exec(`INSERT INTO contents_fts(docid, words) VALUES(?, ?)`,
+		docID,
+		strings.Join(seg, " "),
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
 func main() {
+	db, err := setupDB("database.sqlite")
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
 	listURL := "https://www.aozora.gr.jp/index_pages/person879.html"
 	entries, err := findEntries(listURL)
 	if err != nil {
 		log.Fatal(err)
 	}
 	for _, entry := range entries {
-		fmt.Println(entry.Title, entry.ZipURL)
+		content, err := extractText(entry.ZipURL)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
+		err = addEntry(db, &entry, content)
+		if err != nil {
+			log.Println(err)
+			continue
+		}
 	}
 }
